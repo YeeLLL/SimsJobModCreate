@@ -1,0 +1,6 @@
+{
+  "name": "CareerMod Forge",
+  "description": "AI-powered game career mod JSON generator and economy balance workbench.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
