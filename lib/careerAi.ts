@@ -502,6 +502,22 @@ export function normalizeSafeConstraints(
   };
 }
 
+const ACTIVE_MODEL = 'gemini-4-hydrogen';
+const BACKOFF_BASE_MS = 2000;
+const MAX_503_RETRIES = 2;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function is503Error(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const anyErr = err as { status?: number; code?: number; message?: string };
+  if (anyErr.status === 503 || anyErr.code === 503) return true;
+  const msg = String(anyErr.message ?? '');
+  return /\b503\b|UNAVAILABLE|overloaded|high demand|Service Unavailable/i.test(msg);
+}
+
 function getAiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -530,22 +546,40 @@ export async function runGeminiCareerTask(
   const wantsStream = acceptHeader.includes('text/event-stream');
 
   if (!wantsStream) {
-    const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: prompt,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        responseMimeType: 'application/json',
-        responseSchema: careerResponseSchema,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      },
-    });
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= MAX_503_RETRIES; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model: ACTIVE_MODEL,
+          contents: prompt,
+          config: {
+            systemInstruction: SYSTEM_INSTRUCTION,
+            responseMimeType: 'application/json',
+            responseSchema: careerResponseSchema,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          },
+        });
 
-    const rawText = (response.text ?? '{}').trim();
-    const parsed = JSON.parse(rawText) as RawLlmResponse;
-    const mod = normalizeCareerMod(parsed, tierCount);
-    const designNotes = normalizeDesignNotes(parsed, mod);
-    sendJson(res, 200, { mod, designNotes });
+        const rawText = (response.text ?? '{}').trim();
+        const parsed = JSON.parse(rawText) as RawLlmResponse;
+        const mod = normalizeCareerMod(parsed, tierCount);
+        const designNotes = normalizeDesignNotes(parsed, mod);
+        sendJson(res, 200, { mod, designNotes });
+        return;
+      } catch (err) {
+        lastError = err;
+        if (is503Error(err) && attempt < MAX_503_RETRIES) {
+          await delay(BACKOFF_BASE_MS * 2 ** attempt);
+          continue;
+        }
+        break;
+      }
+    }
+
+    const status = is503Error(lastError) ? 503 : 500;
+    const message =
+      lastError instanceof Error ? lastError.message : 'Unknown error generating career mod.';
+    sendJson(res, status, { error: message, status });
     return;
   }
 
@@ -565,33 +599,49 @@ export async function runGeminiCareerTask(
   }, 3000);
 
   try {
-    const stream = await ai.models.generateContentStream({
-      model: 'gemini-4-hydrogen',
-      contents: prompt,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        responseMimeType: 'application/json',
-        responseSchema: careerResponseSchema,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      },
-    });
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= MAX_503_RETRIES; attempt++) {
+      try {
+        const stream = await ai.models.generateContentStream({
+          model: ACTIVE_MODEL,
+          contents: prompt,
+          config: {
+            systemInstruction: SYSTEM_INSTRUCTION,
+            responseMimeType: 'application/json',
+            responseSchema: careerResponseSchema,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          },
+        });
 
-    let fullText = '';
-    for await (const chunk of stream) {
-      if (chunk.text) {
-        fullText += chunk.text;
-        sendEvent('progress', { chars: fullText.length });
+        let fullText = '';
+        for await (const chunk of stream) {
+          if (chunk.text) {
+            fullText += chunk.text;
+            sendEvent('progress', { chars: fullText.length });
+          }
+        }
+
+        const parsed = JSON.parse((fullText || '{}').trim()) as RawLlmResponse;
+        const mod = normalizeCareerMod(parsed, tierCount);
+        const designNotes = normalizeDesignNotes(parsed, mod);
+        sendEvent('result', { mod, designNotes });
+        return;
+      } catch (err) {
+        lastError = err;
+        if (is503Error(err) && attempt < MAX_503_RETRIES) {
+          sendEvent('progress', { chars: 0 });
+          await delay(BACKOFF_BASE_MS * 2 ** attempt);
+          continue;
+        }
+        throw err;
       }
     }
-
-    const parsed = JSON.parse((fullText || '{}').trim()) as RawLlmResponse;
-    const mod = normalizeCareerMod(parsed, tierCount);
-    const designNotes = normalizeDesignNotes(parsed, mod);
-    sendEvent('result', { mod, designNotes });
+    throw lastError;
   } catch (err) {
     const message =
       err instanceof Error ? err.message : 'Unknown error generating career mod.';
-    sendEvent('error', { error: message });
+    const status = is503Error(err) ? 503 : 500;
+    sendEvent('error', { error: message, status });
   } finally {
     clearInterval(heartbeat);
     res.end();

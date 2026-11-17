@@ -147,12 +147,17 @@ export default function App() {
             mod?: CareerMod;
             designNotes?: CareerDesignNotes;
             error?: string;
+            status?: number;
           };
 
           if (eventName === 'progress' && typeof payload.chars === 'number') {
             setStreamChars(payload.chars);
           } else if (eventName === 'error') {
-            throw new Error(payload.error || 'Generation failed. Please try again.');
+            const err = new Error(
+              payload.error || 'Generation failed. Please try again.'
+            ) as Error & { status?: number };
+            err.status = payload.status;
+            throw err;
           } else if (eventName === 'result' && payload.mod) {
             finalPayload = { mod: payload.mod, designNotes: payload.designNotes };
           }
@@ -166,21 +171,75 @@ export default function App() {
     }
 
     const text = await response.text();
-    let data: { mod?: CareerMod; designNotes?: CareerDesignNotes; error?: string } | null = null;
+    let data: {
+      mod?: CareerMod;
+      designNotes?: CareerDesignNotes;
+      error?: string;
+      status?: number;
+    } | null = null;
     try {
       data = JSON.parse(text);
     } catch {
-      throw new Error(
+      const err = new Error(
         `Server returned a non-JSON response (HTTP ${response.status}). Check that the backend server is running and did not time out.`
-      );
+      ) as Error & { status?: number };
+      err.status = response.status;
+      throw err;
     }
     if (!response.ok) {
-      throw new Error(data?.error || `Request failed (HTTP ${response.status}). Please try again.`);
+      const err = new Error(
+        data?.error || `Request failed (HTTP ${response.status}). Please try again.`
+      ) as Error & { status?: number };
+      err.status = data?.status ?? response.status;
+      throw err;
     }
     if (!data?.mod) {
       throw new Error('Server did not return valid career mod data.');
     }
     return { mod: data.mod, designNotes: data.designNotes };
+  };
+
+  const is503TransientError = (err: unknown): boolean => {
+    if (!err || typeof err !== 'object') return false;
+    const e = err as { status?: number; message?: string };
+    if (e.status === 503) return true;
+    const msg = String(e.message ?? '');
+    return /\b503\b|UNAVAILABLE|overloaded|high demand|Service Unavailable/i.test(msg);
+  };
+
+  const fetchCareerWithRetry = async (
+    endpoint: string,
+    payload: Record<string, unknown>
+  ): Promise<{ mod: CareerMod; designNotes?: CareerDesignNotes }> => {
+    const maxRetries = 2;
+    const baseDelayMs = 2000;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream',
+          },
+          body: JSON.stringify(payload),
+        });
+        if (response.status === 503 && attempt < maxRetries) {
+          await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** attempt));
+          setStreamChars(0);
+          continue;
+        }
+        return await readCareerStreamOrJson(response);
+      } catch (err) {
+        if (is503TransientError(err) && attempt < maxRetries) {
+          await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** attempt));
+          setStreamChars(0);
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw new Error('Service temporarily unavailable (503). Please try again.');
   };
 
   const handleGenerate = async () => {
@@ -189,15 +248,10 @@ export default function App() {
     setStreamChars(0);
     setIsGenerating(true);
     try {
-      const response = await fetch('/api/careers/generate', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-        },
-        body: JSON.stringify({ concept, constraints }),
+      const result = await fetchCareerWithRetry('/api/careers/generate', {
+        concept,
+        constraints,
       });
-      const result = await readCareerStreamOrJson(response);
       setMod(result.mod);
       if (result.designNotes) {
         setDesignNotes(result.designNotes);
@@ -217,19 +271,11 @@ export default function App() {
     setStreamChars(0);
     setIsRefining(true);
     try {
-      const response = await fetch('/api/careers/refine', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-        },
-        body: JSON.stringify({
-          currentMod: mod,
-          instruction,
-          constraints,
-        }),
+      const result = await fetchCareerWithRetry('/api/careers/refine', {
+        currentMod: mod,
+        instruction,
+        constraints,
       });
-      const result = await readCareerStreamOrJson(response);
       setMod(result.mod);
       if (result.designNotes) {
         setDesignNotes(result.designNotes);
