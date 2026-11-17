@@ -122,50 +122,69 @@ export default function App() {
       let buffer = '';
       let finalPayload: { mod: CareerMod; designNotes?: CareerDesignNotes } | null = null;
 
+      const processFrame = (frame: string) => {
+        const lines = frame.split(/\r?\n/);
+        let eventName = 'message';
+        const dataLines: string[] = [];
+        for (const line of lines) {
+          if (line.startsWith('event:')) {
+            eventName = line.slice(6).trim();
+          } else if (line.startsWith('data:')) {
+            dataLines.push(line.slice(5).trim());
+          }
+        }
+        if (dataLines.length === 0) return;
+        const payload = JSON.parse(dataLines.join('\n')) as {
+          chars?: number;
+          mod?: CareerMod;
+          designNotes?: CareerDesignNotes;
+          error?: string;
+          status?: number;
+        };
+
+        if (eventName === 'progress' && typeof payload.chars === 'number') {
+          setStreamChars(payload.chars);
+        } else if (eventName === 'error') {
+          const err = new Error(
+            payload.error || 'Generation failed. Please try again.'
+          ) as Error & { status?: number };
+          err.status = payload.status;
+          throw err;
+        } else if (eventName === 'result' && payload.mod) {
+          finalPayload = { mod: payload.mod, designNotes: payload.designNotes };
+        }
+      };
+
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          buffer += decoder.decode();
+          break;
+        }
         buffer += decoder.decode(value, { stream: true });
 
-        const frames = buffer.split('\n\n');
+        const frames = buffer.split(/\r?\n\r?\n/);
         buffer = frames.pop() ?? '';
-
         for (const frame of frames) {
-          const lines = frame.split('\n');
-          let eventName = 'message';
-          const dataLines: string[] = [];
-          for (const line of lines) {
-            if (line.startsWith('event:')) {
-              eventName = line.slice(6).trim();
-            } else if (line.startsWith('data:')) {
-              dataLines.push(line.slice(5).trim());
-            }
-          }
-          if (dataLines.length === 0) continue;
-          const payload = JSON.parse(dataLines.join('\n')) as {
-            chars?: number;
-            mod?: CareerMod;
-            designNotes?: CareerDesignNotes;
-            error?: string;
-            status?: number;
-          };
+          processFrame(frame);
+        }
+      }
 
-          if (eventName === 'progress' && typeof payload.chars === 'number') {
-            setStreamChars(payload.chars);
-          } else if (eventName === 'error') {
-            const err = new Error(
-              payload.error || 'Generation failed. Please try again.'
-            ) as Error & { status?: number };
-            err.status = payload.status;
-            throw err;
-          } else if (eventName === 'result' && payload.mod) {
-            finalPayload = { mod: payload.mod, designNotes: payload.designNotes };
+      if (buffer.trim()) {
+        for (const frame of buffer.split(/\r?\n\r?\n/)) {
+          if (frame.trim()) {
+            processFrame(frame);
           }
         }
       }
 
       if (!finalPayload) {
-        throw new Error('Stream ended before receiving complete career mod data.');
+        const err = new Error(
+          'Connection closed by server/proxy before AI finished responding (likely a 60s timeout or transient network drop).'
+        ) as Error & { status?: number; isStreamTruncated?: boolean };
+        err.status = 504;
+        err.isStreamTruncated = true;
+        throw err;
       }
       return finalPayload;
     }
@@ -199,12 +218,15 @@ export default function App() {
     return { mod: data.mod, designNotes: data.designNotes };
   };
 
-  const is503TransientError = (err: unknown): boolean => {
+  const isTransientRetryableError = (err: unknown): boolean => {
     if (!err || typeof err !== 'object') return false;
-    const e = err as { status?: number; message?: string };
-    if (e.status === 503) return true;
+    const e = err as { status?: number; message?: string; isStreamTruncated?: boolean };
+    if (e.isStreamTruncated) return true;
+    if (e.status === 502 || e.status === 503 || e.status === 504) return true;
     const msg = String(e.message ?? '');
-    return /\b503\b|UNAVAILABLE|overloaded|high demand|Service Unavailable/i.test(msg);
+    return /\b50[234]\b|UNAVAILABLE|overloaded|high demand|Service Unavailable|timed out|Stream ended/i.test(
+      msg
+    );
   };
 
   const fetchCareerWithRetry = async (
@@ -224,14 +246,17 @@ export default function App() {
           },
           body: JSON.stringify(payload),
         });
-        if (response.status === 503 && attempt < maxRetries) {
+        if (
+          (response.status === 502 || response.status === 503 || response.status === 504) &&
+          attempt < maxRetries
+        ) {
           await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** attempt));
           setStreamChars(0);
           continue;
         }
         return await readCareerStreamOrJson(response);
       } catch (err) {
-        if (is503TransientError(err) && attempt < maxRetries) {
+        if (isTransientRetryableError(err) && attempt < maxRetries) {
           await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** attempt));
           setStreamChars(0);
           continue;

@@ -505,6 +505,8 @@ export function normalizeSafeConstraints(
 const ACTIVE_MODEL = 'gemini-4-hydrogen';
 const BACKOFF_BASE_MS = 2000;
 const MAX_503_RETRIES = 2;
+const ATTEMPT_TIMEOUT_MS = 40000;
+const MAX_RETRY_BUDGET_MS = 46000;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -512,10 +514,18 @@ function delay(ms: number): Promise<void> {
 
 function is503Error(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
-  const anyErr = err as { status?: number; code?: number; message?: string };
+  const anyErr = err as { status?: number; code?: number; message?: string; name?: string };
   if (anyErr.status === 503 || anyErr.code === 503) return true;
+  if (anyErr.name === 'AbortError' || anyErr.name === 'TimeoutError') return true;
   const msg = String(anyErr.message ?? '');
-  return /\b503\b|UNAVAILABLE|overloaded|high demand|Service Unavailable/i.test(msg);
+  return /\b503\b|UNAVAILABLE|overloaded|high demand|Service Unavailable|aborted|timed out/i.test(msg);
+}
+
+function isTimeoutError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const anyErr = err as { name?: string; message?: string };
+  if (anyErr.name === 'AbortError' || anyErr.name === 'TimeoutError') return true;
+  return /aborted|timed out|timeout/i.test(String(anyErr.message ?? ''));
 }
 
 function getAiClient(): GoogleGenAI {
@@ -544,10 +554,25 @@ export async function runGeminiCareerTask(
     ? req.headers.accept.join(',')
     : req.headers.accept || '';
   const wantsStream = acceptHeader.includes('text/event-stream');
+  const startedAt = Date.now();
+
+  let clientClosed = false;
+  let activeController: AbortController | null = null;
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      clientClosed = true;
+      activeController?.abort();
+    }
+  });
 
   if (!wantsStream) {
     let lastError: unknown;
     for (let attempt = 0; attempt <= MAX_503_RETRIES; attempt++) {
+      if (clientClosed) return;
+      const controller = new AbortController();
+      activeController = controller;
+      const timer = setTimeout(() => controller.abort(), ATTEMPT_TIMEOUT_MS);
+
       try {
         const response = await ai.models.generateContent({
           model: ACTIVE_MODEL,
@@ -557,8 +582,10 @@ export async function runGeminiCareerTask(
             responseMimeType: 'application/json',
             responseSchema: careerResponseSchema,
             thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            abortSignal: controller.signal,
           },
         });
+        clearTimeout(timer);
 
         const rawText = (response.text ?? '{}').trim();
         const parsed = JSON.parse(rawText) as RawLlmResponse;
@@ -567,19 +594,35 @@ export async function runGeminiCareerTask(
         sendJson(res, 200, { mod, designNotes });
         return;
       } catch (err) {
+        clearTimeout(timer);
         lastError = err;
-        if (is503Error(err) && attempt < MAX_503_RETRIES) {
-          await delay(BACKOFF_BASE_MS * 2 ** attempt);
+        const backoffMs = BACKOFF_BASE_MS * 2 ** attempt;
+        const elapsed = Date.now() - startedAt;
+        if (
+          !clientClosed &&
+          is503Error(err) &&
+          attempt < MAX_503_RETRIES &&
+          elapsed + backoffMs < MAX_RETRY_BUDGET_MS
+        ) {
+          console.warn(`[careerAi] Attempt ${attempt + 1} failed (${err instanceof Error ? err.message : String(err)}), retrying in ${backoffMs}ms`);
+          await delay(backoffMs);
           continue;
         }
         break;
       }
     }
 
-    const status = is503Error(lastError) ? 503 : 500;
-    const message =
-      lastError instanceof Error ? lastError.message : 'Unknown error generating career mod.';
-    sendJson(res, status, { error: message, status });
+    const timedOut = isTimeoutError(lastError);
+    const status = timedOut ? 504 : is503Error(lastError) ? 503 : 500;
+    const message = timedOut
+      ? 'AI generation timed out waiting for the model response. Please try again.'
+      : lastError instanceof Error
+        ? lastError.message
+        : 'Unknown error generating career mod.';
+    console.error('[careerAi] Non-stream request failed:', status, message);
+    if (!clientClosed && !res.headersSent) {
+      sendJson(res, status, { error: message, status });
+    }
     return;
   }
 
@@ -587,20 +630,30 @@ export async function runGeminiCareerTask(
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
 
   const sendEvent = (event: string, payload: unknown) => {
-    res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+    if (!clientClosed && !res.writableEnded) {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+    }
   };
 
   sendEvent('progress', { chars: 0 });
   const heartbeat = setInterval(() => {
-    res.write(': keep-alive\n\n');
+    if (!clientClosed && !res.writableEnded) {
+      res.write(': keep-alive\n\n');
+    }
   }, 3000);
 
   try {
     let lastError: unknown;
     for (let attempt = 0; attempt <= MAX_503_RETRIES; attempt++) {
+      if (clientClosed) return;
+      const controller = new AbortController();
+      activeController = controller;
+      const timer = setTimeout(() => controller.abort(), ATTEMPT_TIMEOUT_MS);
+
       try {
         const stream = await ai.models.generateContentStream({
           model: ACTIVE_MODEL,
@@ -610,16 +663,20 @@ export async function runGeminiCareerTask(
             responseMimeType: 'application/json',
             responseSchema: careerResponseSchema,
             thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            abortSignal: controller.signal,
           },
         });
 
         let fullText = '';
         for await (const chunk of stream) {
+          if (clientClosed) break;
           if (chunk.text) {
             fullText += chunk.text;
             sendEvent('progress', { chars: fullText.length });
           }
         }
+        clearTimeout(timer);
+        if (clientClosed) return;
 
         const parsed = JSON.parse((fullText || '{}').trim()) as RawLlmResponse;
         const mod = normalizeCareerMod(parsed, tierCount);
@@ -627,10 +684,19 @@ export async function runGeminiCareerTask(
         sendEvent('result', { mod, designNotes });
         return;
       } catch (err) {
+        clearTimeout(timer);
         lastError = err;
-        if (is503Error(err) && attempt < MAX_503_RETRIES) {
+        const backoffMs = BACKOFF_BASE_MS * 2 ** attempt;
+        const elapsed = Date.now() - startedAt;
+        if (
+          !clientClosed &&
+          is503Error(err) &&
+          attempt < MAX_503_RETRIES &&
+          elapsed + backoffMs < MAX_RETRY_BUDGET_MS
+        ) {
+          console.warn(`[careerAi] SSE attempt ${attempt + 1} failed (${err instanceof Error ? err.message : String(err)}), retrying in ${backoffMs}ms`);
           sendEvent('progress', { chars: 0 });
-          await delay(BACKOFF_BASE_MS * 2 ** attempt);
+          await delay(backoffMs);
           continue;
         }
         throw err;
@@ -638,13 +704,20 @@ export async function runGeminiCareerTask(
     }
     throw lastError;
   } catch (err) {
-    const message =
-      err instanceof Error ? err.message : 'Unknown error generating career mod.';
-    const status = is503Error(err) ? 503 : 500;
+    const timedOut = isTimeoutError(err);
+    const status = timedOut ? 504 : is503Error(err) ? 503 : 500;
+    const message = timedOut
+      ? 'AI generation timed out waiting for the model response. Please try again.'
+      : err instanceof Error
+        ? err.message
+        : 'Unknown error generating career mod.';
+    console.error('[careerAi] SSE request failed:', status, message);
     sendEvent('error', { error: message, status });
   } finally {
     clearInterval(heartbeat);
-    res.end();
+    if (!res.writableEnded) {
+      res.end();
+    }
   }
 }
 
