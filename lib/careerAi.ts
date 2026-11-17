@@ -502,20 +502,37 @@ export function normalizeSafeConstraints(
   };
 }
 
-const ACTIVE_MODEL = 'gemini-4-hydrogen';
+const PRIMARY_MODEL = 'gemini-4-hydrogen';
+const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
 const BACKOFF_BASE_MS = 2000;
-const MAX_503_RETRIES = 2;
-const ATTEMPT_TIMEOUT_MS = 40000;
-const MAX_RETRY_BUDGET_MS = 46000;
+const ATTEMPT_TIMEOUT_MS = 35000;
+const MAX_WALL_BUDGET_MS = 46000;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function getErrorStatus(err: unknown): number | undefined {
+  if (!err || typeof err !== 'object') return undefined;
+  const anyErr = err as { status?: number; code?: number };
+  return typeof anyErr.status === 'number'
+    ? anyErr.status
+    : typeof anyErr.code === 'number'
+      ? anyErr.code
+      : undefined;
+}
+
+function is429Error(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  if (getErrorStatus(err) === 429) return true;
+  const msg = String((err as { message?: string }).message ?? '');
+  return /\b429\b|RESOURCE_EXHAUSTED|Too Many Requests|Quota exceeded/i.test(msg);
+}
+
 function is503Error(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
-  const anyErr = err as { status?: number; code?: number; message?: string; name?: string };
-  if (anyErr.status === 503 || anyErr.code === 503) return true;
+  const anyErr = err as { name?: string; message?: string };
+  if (getErrorStatus(err) === 503) return true;
   if (anyErr.name === 'AbortError' || anyErr.name === 'TimeoutError') return true;
   const msg = String(anyErr.message ?? '');
   return /\b503\b|UNAVAILABLE|overloaded|high demand|Service Unavailable|aborted|timed out/i.test(msg);
@@ -526,6 +543,48 @@ function isTimeoutError(err: unknown): boolean {
   const anyErr = err as { name?: string; message?: string };
   if (anyErr.name === 'AbortError' || anyErr.name === 'TimeoutError') return true;
   return /aborted|timed out|timeout/i.test(String(anyErr.message ?? ''));
+}
+
+function formatFriendlyError(err: unknown): { status: number; message: string } {
+  if (is429Error(err)) {
+    const rawMsg = err instanceof Error ? err.message : String(err ?? '');
+    const retryMatch = rawMsg.match(/Please retry in ([^\s."\\]+)/i);
+    const limitMatch = rawMsg.match(/limit:\s*(\d+)/i);
+    const retryHint = retryMatch ? ` Retry window: ${retryMatch[1]}.` : '';
+    const limitHint = limitMatch ? ` (${limitMatch[1]} req/day Free Tier limit)` : '';
+    return {
+      status: 429,
+      message: `Gemini Free Tier quota exceeded${limitHint}.${retryHint} Attach a billing-enabled API key in Settings > Secrets (or Vercel Environment Variables) to unlock higher daily limits.`,
+    };
+  }
+  if (isTimeoutError(err)) {
+    return {
+      status: 504,
+      message: 'AI generation timed out waiting for the model response. Please try again.',
+    };
+  }
+  if (is503Error(err)) {
+    return {
+      status: 503,
+      message: 'Gemini is temporarily overloaded (503). Please try again in a moment.',
+    };
+  }
+  return {
+    status: getErrorStatus(err) ?? 500,
+    message: err instanceof Error ? err.message : 'Unknown error generating career mod.',
+  };
+}
+
+function buildModelConfig(model: string, abortSignal: AbortSignal) {
+  return {
+    systemInstruction: SYSTEM_INSTRUCTION,
+    responseMimeType: 'application/json',
+    responseSchema: careerResponseSchema,
+    thinkingConfig: {
+      thinkingLevel: model === FALLBACK_MODEL ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW,
+    },
+    abortSignal,
+  };
 }
 
 function getAiClient(): GoogleGenAI {
@@ -565,25 +624,40 @@ export async function runGeminiCareerTask(
     }
   });
 
+  // At most 1 retry on PRIMARY_MODEL for 503, then 1 fallback attempt on FALLBACK_MODEL on 429/503.
+  const attemptPlan: Array<{ model: string; backoffBeforeMs: number }> = [
+    { model: PRIMARY_MODEL, backoffBeforeMs: 0 },
+    { model: PRIMARY_MODEL, backoffBeforeMs: BACKOFF_BASE_MS },
+    { model: FALLBACK_MODEL, backoffBeforeMs: 0 },
+  ];
+
   if (!wantsStream) {
     let lastError: unknown;
-    for (let attempt = 0; attempt <= MAX_503_RETRIES; attempt++) {
+    for (let i = 0; i < attemptPlan.length; i++) {
       if (clientClosed) return;
+      const step = attemptPlan[i];
+      if (i > 0) {
+        const prevIs429 = is429Error(lastError);
+        const prevIs503 = is503Error(lastError);
+        if (!prevIs429 && !prevIs503) break;
+        // Skip second PRIMARY_MODEL attempt immediately when 429 quota is exhausted
+        if (prevIs429 && step.model === PRIMARY_MODEL) continue;
+        const elapsed = Date.now() - startedAt;
+        if (elapsed + step.backoffBeforeMs >= MAX_WALL_BUDGET_MS) break;
+        if (step.backoffBeforeMs > 0) {
+          await delay(step.backoffBeforeMs);
+        }
+      }
+
       const controller = new AbortController();
       activeController = controller;
       const timer = setTimeout(() => controller.abort(), ATTEMPT_TIMEOUT_MS);
 
       try {
         const response = await ai.models.generateContent({
-          model: ACTIVE_MODEL,
+          model: step.model,
           contents: prompt,
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-            responseMimeType: 'application/json',
-            responseSchema: careerResponseSchema,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            abortSignal: controller.signal,
-          },
+          config: buildModelConfig(step.model, controller.signal),
         });
         clearTimeout(timer);
 
@@ -596,32 +670,18 @@ export async function runGeminiCareerTask(
       } catch (err) {
         clearTimeout(timer);
         lastError = err;
-        const backoffMs = BACKOFF_BASE_MS * 2 ** attempt;
-        const elapsed = Date.now() - startedAt;
-        if (
-          !clientClosed &&
-          is503Error(err) &&
-          attempt < MAX_503_RETRIES &&
-          elapsed + backoffMs < MAX_RETRY_BUDGET_MS
-        ) {
-          console.warn(`[careerAi] Attempt ${attempt + 1} failed (${err instanceof Error ? err.message : String(err)}), retrying in ${backoffMs}ms`);
-          await delay(backoffMs);
-          continue;
-        }
-        break;
+        console.warn(
+          `[careerAi] Non-stream attempt (${step.model}) failed:`,
+          getErrorStatus(err) ?? '',
+          err instanceof Error ? err.message : String(err)
+        );
       }
     }
 
-    const timedOut = isTimeoutError(lastError);
-    const status = timedOut ? 504 : is503Error(lastError) ? 503 : 500;
-    const message = timedOut
-      ? 'AI generation timed out waiting for the model response. Please try again.'
-      : lastError instanceof Error
-        ? lastError.message
-        : 'Unknown error generating career mod.';
-    console.error('[careerAi] Non-stream request failed:', status, message);
+    const formatted = formatFriendlyError(lastError);
+    console.error('[careerAi] Non-stream request failed:', formatted.status, formatted.message);
     if (!clientClosed && !res.headersSent) {
-      sendJson(res, status, { error: message, status });
+      sendJson(res, formatted.status, { error: formatted.message, status: formatted.status });
     }
     return;
   }
@@ -648,23 +708,31 @@ export async function runGeminiCareerTask(
 
   try {
     let lastError: unknown;
-    for (let attempt = 0; attempt <= MAX_503_RETRIES; attempt++) {
+    for (let i = 0; i < attemptPlan.length; i++) {
       if (clientClosed) return;
+      const step = attemptPlan[i];
+      if (i > 0) {
+        const prevIs429 = is429Error(lastError);
+        const prevIs503 = is503Error(lastError);
+        if (!prevIs429 && !prevIs503) break;
+        if (prevIs429 && step.model === PRIMARY_MODEL) continue;
+        const elapsed = Date.now() - startedAt;
+        if (elapsed + step.backoffBeforeMs >= MAX_WALL_BUDGET_MS) break;
+        sendEvent('progress', { chars: 0 });
+        if (step.backoffBeforeMs > 0) {
+          await delay(step.backoffBeforeMs);
+        }
+      }
+
       const controller = new AbortController();
       activeController = controller;
       const timer = setTimeout(() => controller.abort(), ATTEMPT_TIMEOUT_MS);
 
       try {
         const stream = await ai.models.generateContentStream({
-          model: ACTIVE_MODEL,
+          model: step.model,
           contents: prompt,
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-            responseMimeType: 'application/json',
-            responseSchema: careerResponseSchema,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            abortSignal: controller.signal,
-          },
+          config: buildModelConfig(step.model, controller.signal),
         });
 
         let fullText = '';
@@ -686,33 +754,18 @@ export async function runGeminiCareerTask(
       } catch (err) {
         clearTimeout(timer);
         lastError = err;
-        const backoffMs = BACKOFF_BASE_MS * 2 ** attempt;
-        const elapsed = Date.now() - startedAt;
-        if (
-          !clientClosed &&
-          is503Error(err) &&
-          attempt < MAX_503_RETRIES &&
-          elapsed + backoffMs < MAX_RETRY_BUDGET_MS
-        ) {
-          console.warn(`[careerAi] SSE attempt ${attempt + 1} failed (${err instanceof Error ? err.message : String(err)}), retrying in ${backoffMs}ms`);
-          sendEvent('progress', { chars: 0 });
-          await delay(backoffMs);
-          continue;
-        }
-        throw err;
+        console.warn(
+          `[careerAi] SSE attempt (${step.model}) failed:`,
+          getErrorStatus(err) ?? '',
+          err instanceof Error ? err.message : String(err)
+        );
       }
     }
     throw lastError;
   } catch (err) {
-    const timedOut = isTimeoutError(err);
-    const status = timedOut ? 504 : is503Error(err) ? 503 : 500;
-    const message = timedOut
-      ? 'AI generation timed out waiting for the model response. Please try again.'
-      : err instanceof Error
-        ? err.message
-        : 'Unknown error generating career mod.';
-    console.error('[careerAi] SSE request failed:', status, message);
-    sendEvent('error', { error: message, status });
+    const formatted = formatFriendlyError(err);
+    console.error('[careerAi] SSE request failed:', formatted.status, formatted.message);
+    sendEvent('error', { error: formatted.message, status: formatted.status });
   } finally {
     clearInterval(heartbeat);
     if (!res.writableEnded) {

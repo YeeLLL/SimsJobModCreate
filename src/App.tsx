@@ -147,8 +147,9 @@ export default function App() {
         } else if (eventName === 'error') {
           const err = new Error(
             payload.error || 'Generation failed. Please try again.'
-          ) as Error & { status?: number };
+          ) as Error & { status?: number; fromServer?: boolean };
           err.status = payload.status;
+          err.fromServer = true;
           throw err;
         } else if (eventName === 'result' && payload.mod) {
           finalPayload = { mod: payload.mod, designNotes: payload.designNotes };
@@ -208,8 +209,9 @@ export default function App() {
     if (!response.ok) {
       const err = new Error(
         data?.error || `Request failed (HTTP ${response.status}). Please try again.`
-      ) as Error & { status?: number };
+      ) as Error & { status?: number; fromServer?: boolean };
       err.status = data?.status ?? response.status;
+      err.fromServer = true;
       throw err;
     }
     if (!data?.mod) {
@@ -220,11 +222,18 @@ export default function App() {
 
   const isTransientRetryableError = (err: unknown): boolean => {
     if (!err || typeof err !== 'object') return false;
-    const e = err as { status?: number; message?: string; isStreamTruncated?: boolean };
+    const e = err as {
+      status?: number;
+      message?: string;
+      isStreamTruncated?: boolean;
+      fromServer?: boolean;
+    };
+    // Never multiply retries when the backend already executed its own retry/fallback plan, or on 429 quota limits.
+    if (e.fromServer || e.status === 429) return false;
     if (e.isStreamTruncated) return true;
     if (e.status === 502 || e.status === 503 || e.status === 504) return true;
     const msg = String(e.message ?? '');
-    return /\b50[234]\b|UNAVAILABLE|overloaded|high demand|Service Unavailable|timed out|Stream ended/i.test(
+    return /\b50[234]\b|UNAVAILABLE|overloaded|high demand|Service Unavailable|timed out/i.test(
       msg
     );
   };
@@ -233,7 +242,7 @@ export default function App() {
     endpoint: string,
     payload: Record<string, unknown>
   ): Promise<{ mod: CareerMod; designNotes?: CareerDesignNotes }> => {
-    const maxRetries = 2;
+    const maxRetries = 1;
     const baseDelayMs = 2000;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -264,7 +273,7 @@ export default function App() {
         throw err;
       }
     }
-    throw new Error('Service temporarily unavailable (503). Please try again.');
+    throw new Error('Service temporarily unavailable. Please try again.');
   };
 
   const handleGenerate = async () => {
